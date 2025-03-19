@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::prelude::*;
 use std::ptr;
@@ -14,12 +14,47 @@ use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     ReadDirectoryChangesW,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
     RegNotifyChangeKeyValue, RegOpenKeyExA,
 };
-use windows::Win32::System::Threading::{CreateThread, LPTHREAD_START_ROUTINE};
+use windows::Win32::System::Threading::{
+    CreateThread, GetProcessId, LPTHREAD_START_ROUTINE, OpenProcess, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_READ,
+};
 use windows::core::PCSTR;
+
+fn get_process_info(pid: u32) -> Option<(String, u32, String)> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32 {
+            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            ..Default::default()
+        };
+
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let cstr = unsafe { CStr::from_ptr(entry.szExeFile.as_ptr()) };
+                    let process_name = cstr.to_string_lossy().to_string();
+                    let parent_pid = entry.th32ParentProcessID;
+                    return Some((
+                        process_name,
+                        parent_pid,
+                        format!("PID: {}, PPID: {}", pid, parent_pid),
+                    ));
+                }
+                if Process32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Monitor file system changes using ReadDirectoryChangesW
 fn monitor_files(directory: &str) {
@@ -57,9 +92,21 @@ fn monitor_files(directory: &str) {
                 None,
             );
 
-            match success {
-                Ok(res) => println!("📂 File system change detected in {}", directory),
-                Err(err) => println!("❌ Error monitoring directory"),
+            if let Ok(_) = success {
+                let pid = GetProcessId(handle); // Get process ID of last modification
+                if let Some((process_name, parent_pid, details)) = get_process_info(pid) {
+                    println!(
+                        "📂 Change detected in {} | Process: {} | {}",
+                        directory, process_name, details
+                    );
+                } else {
+                    println!(
+                        "📂 Change detected in {}, but process info unavailable",
+                        directory
+                    );
+                }
+            } else {
+                println!("❌ Error monitoring directory");
             }
 
             thread::sleep(Duration::from_secs(2));
